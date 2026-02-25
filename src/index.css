@@ -1,0 +1,60 @@
+:root {
+  font-family: 'Outfit', 'Noto Sans SC', system-ui, -apple-system, sans-serif;
+  line-height: 1.5;
+  font-weight: 500;
+
+  color: #111827;
+  background-color: #f8fafc;
+  /* Very light cool gray/white */
+
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* Flat UI Colors based on image */
+  --color-red: #ef4444;
+  /* Primary Red */
+  --color-red-light: #fee2e2;
+  /* Unrevealed Red tint */
+
+  --color-blue: #3b82f6;
+  /* Primary Blue */
+  --color-blue-light: #dbeafe;
+  /* Unrevealed Blue tint */
+
+  --color-neutral: #9ca3af;
+  /* Neutral Gray indicator */
+  --color-neutral-light: #f3f4f6;
+  /* Neutral card bg */
+
+  --color-assassin: #000000;
+  /* Black assassin */
+  --color-assassin-light: #f3f4f6;
+  /* Black assassin hidden (looks neutral) */
+
+  --color-border: #cbd5e1;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+button {
+  border: none;
+  background: none;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+  outline: none;
+}
