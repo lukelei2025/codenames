@@ -10,10 +10,12 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
 }
 
 const RUNS_PER_DIFFICULTY = Number(process.env.RUNS_PER_DIFFICULTY || 10);
+const MAX_ATTEMPTS_PER_RUN = Number(process.env.MAX_ATTEMPTS_PER_RUN || 1);
 const LANGUAGE = process.env.TEST_LANGUAGE || "中文";
 const THEME = process.env.TEST_THEME || "";
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 280000);
 const PAUSE_MS = Number(process.env.PAUSE_MS || 250);
+const RETRY_PAUSE_MS = Number(process.env.RETRY_PAUSE_MS || 600);
 
 const allDifficulties = ["简易", "适中", "困难"];
 const requestedDifficulties = (process.env.TEST_DIFFICULTIES || "")
@@ -64,11 +66,30 @@ function parseSSEChunk(state, chunkText) {
       continue;
     }
 
+    if (payload.startsWith("__META__")) {
+      try {
+        state.meta = JSON.parse(payload.slice(8));
+      } catch {
+        state.metaParseError = true;
+      }
+      continue;
+    }
+
     if (payload.startsWith("__WORD__")) {
       const word = payload.slice(8).trim();
       if (word) state.wordsSeen.push(word);
     }
   }
+}
+
+function providerOf(result) {
+  return result?.meta?.primaryProvider || "unknown";
+}
+
+function fallbackUsed(result) {
+  const usedCount = result?.meta?.fallback?.usedCount;
+  if (typeof usedCount === "number") return usedCount > 0;
+  return Boolean(result?.meta?.primaryUsedFallback);
 }
 
 function cardColorCounts(cards) {
@@ -146,6 +167,8 @@ async function runOne(difficulty, runIndex) {
       error: "",
       cards: null,
       cardsParseError: false,
+      meta: null,
+      metaParseError: false,
       wordsSeen: [],
     };
 
@@ -169,6 +192,8 @@ async function runOne(difficulty, runIndex) {
         streamError: state.error,
         wordsSeenCount: state.wordsSeen.length,
         cardsSeenCount: Array.isArray(state.cards) ? state.cards.length : 0,
+        meta: state.meta,
+        metaParseError: state.metaParseError,
         durationMs,
       };
     }
@@ -180,6 +205,8 @@ async function runOne(difficulty, runIndex) {
         ok: false,
         reason: state.cardsParseError ? "cards_parse_error" : "missing_cards",
         wordsSeenCount: state.wordsSeen.length,
+        meta: state.meta,
+        metaParseError: state.metaParseError,
         durationMs,
       };
     }
@@ -192,6 +219,8 @@ async function runOne(difficulty, runIndex) {
       reason: board.shapeOk ? "ok" : "invalid_board_shape",
       durationMs,
       wordsSeenCount: state.wordsSeen.length,
+      meta: state.meta,
+      metaParseError: state.metaParseError,
       board,
     };
   } catch (err) {
@@ -206,6 +235,45 @@ async function runOne(difficulty, runIndex) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function runWithRetries(difficulty, runIndex) {
+  const attempts = [];
+  let lastResult = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_RUN; attempt++) {
+    const result = await runOne(difficulty, runIndex);
+    lastResult = result;
+    attempts.push({
+      attempt,
+      ok: result.ok,
+      reason: result.reason,
+      durationMs: result.durationMs,
+      error: result.error,
+      streamError: result.streamError,
+      httpStatus: result.httpStatus,
+    });
+
+    if (result.ok) {
+      return {
+        ...result,
+        attemptsTried: attempt,
+        successOnAttempt: attempt,
+        attempts,
+      };
+    }
+
+    if (attempt < MAX_ATTEMPTS_PER_RUN && RETRY_PAUSE_MS > 0) {
+      await sleep(RETRY_PAUSE_MS);
+    }
+  }
+
+  return {
+    ...lastResult,
+    attemptsTried: MAX_ATTEMPTS_PER_RUN,
+    successOnAttempt: null,
+    attempts,
+  };
 }
 
 function mean(values) {
@@ -244,14 +312,50 @@ function buildDifficultySummary(results) {
 
   const durations = results.map((r) => r.durationMs).filter((n) => typeof n === "number");
   const successDurations = successes.map((r) => r.durationMs);
+  const attemptsUsedAll = results.map((r) => r.attemptsTried ?? 1);
+  const attemptsUsedSuccess = successes.map((r) => r.attemptsTried ?? 1);
+  const successAttemptDistribution = Object.fromEntries(
+    Object.entries(
+      successes.reduce((acc, r) => {
+        const key = String(r.successOnAttempt ?? 1);
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {}),
+    ).sort((a, b) => Number(a[0]) - Number(b[0])),
+  );
 
   const wordFreq = new Map();
   const assassinFreq = new Map();
+  const providerCounts = new Map();
+  const successByAttemptProvider = new Map();
+  const fallbackCountByLabel = new Map();
+  let fallbackUsedRuns = 0;
   const boards = [];
+  const boardsByProvider = new Map();
+  const boardsByAttempt = new Map();
 
   for (const r of successes) {
     const words = r.board.words;
     boards.push(words);
+    const provider = providerOf(r);
+    const attempt = Number(r.successOnAttempt || 1);
+    providerCounts.set(provider, (providerCounts.get(provider) || 0) + 1);
+    const apKey = `${attempt}|${provider}`;
+    successByAttemptProvider.set(apKey, (successByAttemptProvider.get(apKey) || 0) + 1);
+
+    if (!boardsByProvider.has(provider)) boardsByProvider.set(provider, []);
+    boardsByProvider.get(provider).push(words);
+    if (!boardsByAttempt.has(attempt)) boardsByAttempt.set(attempt, []);
+    boardsByAttempt.get(attempt).push(words);
+
+    if (fallbackUsed(r)) {
+      fallbackUsedRuns += 1;
+      const labels = r?.meta?.fallback?.labels || [];
+      for (const label of labels) {
+        fallbackCountByLabel.set(label, (fallbackCountByLabel.get(label) || 0) + 1);
+      }
+    }
+
     for (const w of words) {
       wordFreq.set(w, (wordFreq.get(w) || 0) + 1);
     }
@@ -265,6 +369,68 @@ function buildDifficultySummary(results) {
   for (let i = 0; i < boards.length; i++) {
     for (let j = i + 1; j < boards.length; j++) {
       pairwiseJaccard.push(jaccard(boards[i], boards[j]));
+    }
+  }
+
+  const overlapByProvider = Object.fromEntries(
+    [...boardsByProvider.entries()].map(([provider, providerBoards]) => {
+      const vals = [];
+      for (let i = 0; i < providerBoards.length; i++) {
+        for (let j = i + 1; j < providerBoards.length; j++) {
+          vals.push(jaccard(providerBoards[i], providerBoards[j]));
+        }
+      }
+      return [
+        provider,
+        {
+          boards: providerBoards.length,
+          pairCount: vals.length,
+          meanJaccard: mean(vals),
+          p95Jaccard: percentile(vals, 95),
+        },
+      ];
+    }),
+  );
+
+  const attemptBuckets = Object.fromEntries(
+    [...boardsByAttempt.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([attempt, attemptBoards]) => {
+        const vals = [];
+        for (let i = 0; i < attemptBoards.length; i++) {
+          for (let j = i + 1; j < attemptBoards.length; j++) {
+            vals.push(jaccard(attemptBoards[i], attemptBoards[j]));
+          }
+        }
+        return [
+          String(attempt),
+          {
+            boards: attemptBoards.length,
+            pairCount: vals.length,
+            meanJaccard: mean(vals),
+            p95Jaccard: percentile(vals, 95),
+          },
+        ];
+      }),
+  );
+
+  const crossAttemptOverlap = {};
+  const attemptKeys = [...boardsByAttempt.keys()].sort((a, b) => a - b);
+  for (let i = 0; i < attemptKeys.length; i++) {
+    for (let j = i + 1; j < attemptKeys.length; j++) {
+      const a = attemptKeys[i];
+      const b = attemptKeys[j];
+      const vals = [];
+      for (const ba of boardsByAttempt.get(a)) {
+        for (const bb of boardsByAttempt.get(b)) {
+          vals.push(jaccard(ba, bb));
+        }
+      }
+      crossAttemptOverlap[`${a}_vs_${b}`] = {
+        pairCount: vals.length,
+        meanJaccard: mean(vals),
+        p95Jaccard: percentile(vals, 95),
+      };
     }
   }
 
@@ -290,10 +456,41 @@ function buildDifficultySummary(results) {
       avgSuccess: mean(successDurations),
       p95Success: percentile(successDurations, 95),
     },
+    attempts: {
+      maxAttemptsPerRun: MAX_ATTEMPTS_PER_RUN,
+      avgAll: mean(attemptsUsedAll),
+      avgSuccess: mean(attemptsUsedSuccess),
+      successOnAttemptCounts: successAttemptDistribution,
+      successByAttemptAndProvider: Object.fromEntries(
+        [...successByAttemptProvider.entries()]
+          .sort((a, b) => {
+            const [aa, ap] = a[0].split("|");
+            const [ba, bp] = b[0].split("|");
+            return Number(aa) - Number(ba) || ap.localeCompare(bp);
+          })
+          .map(([k, v]) => {
+            const [attempt, provider] = k.split("|");
+            return [`attempt_${attempt}.${provider}`, v];
+          }),
+      ),
+    },
+    modelUsage: {
+      primaryProviderCounts: Object.fromEntries(
+        [...providerCounts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])),
+      ),
+      fallbackUsedRuns,
+      fallbackUsedRate: successes.length ? fallbackUsedRuns / successes.length : null,
+      fallbackLabelCounts: Object.fromEntries(
+        [...fallbackCountByLabel.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])),
+      ),
+    },
     overlap: {
       pairCount: pairwiseJaccard.length,
       meanJaccard: mean(pairwiseJaccard),
       p95Jaccard: percentile(pairwiseJaccard, 95),
+      byProvider: overlapByProvider,
+      bySuccessAttempt: attemptBuckets,
+      crossSuccessAttempts: crossAttemptOverlap,
     },
     topRepeatedWords,
     topAssassinWords,
@@ -312,10 +509,13 @@ async function main() {
 
   for (const difficulty of DIFFICULTIES) {
     for (let i = 0; i < RUNS_PER_DIFFICULTY; i++) {
-      const result = await runOne(difficulty, i + 1);
+      const result = await runWithRetries(difficulty, i + 1);
       allResults.push(result);
       const sec = (result.durationMs / 1000).toFixed(1);
-      console.log(`[${difficulty}] ${i + 1}/${RUNS_PER_DIFFICULTY} -> ${result.reason} (ok=${result.ok}, ${sec}s)`);
+      const attemptText = result.ok
+        ? `success_on_attempt=${result.successOnAttempt}`
+        : `failed_after_attempt=${result.attemptsTried}`;
+      console.log(`[${difficulty}] ${i + 1}/${RUNS_PER_DIFFICULTY} -> ${result.reason} (ok=${result.ok}, ${sec}s, ${attemptText})`);
       if (PAUSE_MS > 0) await sleep(PAUSE_MS);
     }
   }
@@ -333,6 +533,7 @@ async function main() {
       generatedAt: new Date().toISOString(),
       totalDurationMs: Date.now() - runStartedAt,
       runsPerDifficulty: RUNS_PER_DIFFICULTY,
+      maxAttemptsPerRun: MAX_ATTEMPTS_PER_RUN,
       language: LANGUAGE,
       theme: THEME,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,

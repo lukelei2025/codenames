@@ -69,6 +69,22 @@ function getHardModeCooldownWords(seed: number, count = 8): string[] {
    return selected
 }
 
+function getMediumModeCooldownWords(seed: number, count = 8): string[] {
+   const pool = [
+      '发酵', '潮汐', '偏见', '内卷', '熵增', '悖论', '杠杆', '防火墙',
+      '算法', '像素', '黑洞', '越位', '泡沫', '芯片', '通胀', '过滤',
+      '筹码', '垄断', '雷达', '共鸣', '抛物线', '冥想', '迭代', '对冲',
+      '博弈', '盲区', '分红', '嫁接', '梦游', '透镜',
+   ]
+
+   const start = seed % pool.length
+   const selected: string[] = []
+   for (let i = 0; i < count; i++) {
+      selected.push(pool[(start + i) % pool.length])
+   }
+   return selected
+}
+
 function isGenericTheme(theme: string): boolean {
    const t = theme.trim().toLowerCase()
    return (
@@ -88,6 +104,9 @@ export function buildPrompt(language: string, theme: string, difficulty: string,
    const hasSpecificTheme = !isGenericTheme(theme)
    const hardCooldownWords = difficulty === '困难' && !hasSpecificTheme
       ? getHardModeCooldownWords(seed, 8)
+      : []
+   const mediumCooldownWords = difficulty === '适中' && !hasSpecificTheme
+      ? getMediumModeCooldownWords(seed, 8)
       : []
 
    // Determine how many words must come from the mandatory domain
@@ -139,6 +158,19 @@ ${hardCooldownWords.join(', ')}
 `
       : ''
 
+   const mediumCooldownBlock = mediumCooldownWords.length > 0
+      ? `═══════════════════════════════════
+MEDIUM MODE COOLDOWN WORDS (Seed-Rotated)
+═══════════════════════════════════
+For THIS run, avoid these over-repeated medium-mode anchors:
+${mediumCooldownWords.join(', ')}
+`
+      : ''
+
+   const mediumAnchorClusterRule = difficulty === '适中'
+      ? `- MEDIUM anchor cluster cap: from this cluster [发酵, 潮汐, 偏见, 内卷, 熵增, 悖论, 杠杆, 防火墙, 算法, 像素], include AT MOST 1 word per board.`
+      : ''
+
    return `You are an expert Codenames board designer.
 Generate exactly 25 unique words/phrases for a Codenames board.
 
@@ -160,6 +192,7 @@ BANNED WORDS — DO NOT USE THESE
 The following words are BANNED for this session. Do NOT output any of them:
 ${bannedWords}
 
+${mediumCooldownBlock}
 ${hardCooldownBlock}
 
 ═══════════════════════════════════
@@ -169,6 +202,7 @@ ANTI-REPETITION RULES
 - For each word you pick, ask: "Would another AI also pick this?" If yes, REPLACE IT.
 - Aim for words that make a player say "哦！这个词有意思" not "又是这个".
 - Prefer distinct first characters for Chinese words. Soft cap: at most 2 first-character collisions across the board. If this hurts word quality, prioritize better words.
+${mediumAnchorClusterRule}
 
 ═══════════════════════════════════
 VOCABULARY RULES BY DIFFICULTY

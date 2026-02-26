@@ -7,6 +7,60 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
+type RecentBoardRecord = { words: string[]; ts: number }
+const recentBoardsByBucket = new Map<string, RecentBoardRecord[]>()
+const RECENT_HISTORY_LIMIT_PER_BUCKET = 20
+const RECENT_LOOKBACK_BOARDS = 12
+const HOT_WORD_MIN_COUNT = 2
+const HOT_WORD_MAX_COUNT = 12
+const MEDIUM_ANCHOR_CLUSTER = ['发酵', '潮汐', '偏见', '内卷', '熵增', '悖论', '杠杆', '防火墙', '算法', '像素']
+const HARD_ANCHOR_CLUSTER = ['熵增', '路径依赖', '认知失调', '破窗效应', '范式转移', '灰犀牛', '黑天鹅', '模因']
+
+const normalizeThemeBucket = (theme: string): string => {
+  const raw = (theme || '').trim().toLowerCase()
+  if (!raw || raw === 'general / random' || raw === 'general' || raw === 'random' || raw === '通用' || raw === '随机' || raw === '综合') {
+    return '__generic__'
+  }
+  return raw
+}
+
+const makeHistoryBucketKey = (language: string, difficulty: string, theme: string): string =>
+  `${language}::${difficulty}::${normalizeThemeBucket(theme)}`
+
+const readRecentBoards = (bucketKey: string): string[][] =>
+  (recentBoardsByBucket.get(bucketKey) ?? []).slice(-RECENT_LOOKBACK_BOARDS).map((r) => r.words)
+
+const addBoardToRecentMemory = (bucketKey: string, words: string[]) => {
+  const board = words.slice(0, 25)
+  if (board.length < 25) return
+  const list = recentBoardsByBucket.get(bucketKey) ?? []
+  list.push({ words: board, ts: Date.now() })
+  while (list.length > RECENT_HISTORY_LIMIT_PER_BUCKET) list.shift()
+  recentBoardsByBucket.set(bucketKey, list)
+}
+
+const jaccard = (aWords: string[], bWords: string[]): number => {
+  const a = new Set(aWords)
+  const b = new Set(bWords)
+  let overlap = 0
+  for (const w of a) if (b.has(w)) overlap += 1
+  const union = a.size + b.size - overlap
+  return union === 0 ? 0 : overlap / union
+}
+
+const maxJaccardAgainstRecent = (words: string[], recentBoards: string[][]) => {
+  let maxJaccard = 0
+  let mostSimilar: string[] | null = null
+  for (const board of recentBoards) {
+    const score = jaccard(words, board)
+    if (score > maxJaccard) {
+      maxJaccard = score
+      mostSimilar = board
+    }
+  }
+  return { maxJaccard, mostSimilar }
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
@@ -15,19 +69,44 @@ Deno.serve(async (req) => {
   try {
     const { theme = '', language = '中文', difficulty = '适中', responseMode = 'stream' } = await req.json()
 
-    const apiKey = Deno.env.get('GLM_API_KEY')
-    if (!apiKey) throw new Error('GLM_API_KEY is not set')
+    const glmApiKey = Deno.env.get('GLM_API_KEY')
+    if (!glmApiKey) throw new Error('GLM_API_KEY is not set')
+
+    const deepseekApiKey = Deno.env.get('DEEPSEEK_API_KEY') ?? ''
+    const rawDeepseekApiUrl = (Deno.env.get('DEEPSEEK_API_URL') ?? '').trim()
+    const deepseekApiUrl = rawDeepseekApiUrl
+      ? (rawDeepseekApiUrl.replace(/\/+$/, '').endsWith('/chat/completions')
+        ? rawDeepseekApiUrl.replace(/\/+$/, '')
+        : `${rawDeepseekApiUrl.replace(/\/+$/, '')}/chat/completions`)
+      : 'https://api.deepseek.com/chat/completions'
+    const deepseekModel = Deno.env.get('DEEPSEEK_MODEL') ?? 'deepseek-chat'
 
     const seed = Math.floor(Math.random() * 1_000_000_000)
     const systemPrompt = buildPrompt(language, theme || 'General / Random', difficulty, seed)
+    const historyBucketKey = makeHistoryBucketKey(language, difficulty, theme || 'General / Random')
+    const recentBoards = readRecentBoards(historyBucketKey)
+    const recentWordFreq = new Map<string, number>()
+    for (const board of recentBoards) {
+      for (const w of board) {
+        recentWordFreq.set(w, (recentWordFreq.get(w) ?? 0) + 1)
+      }
+    }
+    const recentHotWords = [...recentWordFreq.entries()]
+      .filter(([, count]) => count >= HOT_WORD_MIN_COUNT)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, HOT_WORD_MAX_COUNT)
+      .map(([word]) => word)
 
     console.log(`Generating board: theme=${theme}, lang=${language}, diff=${difficulty}, seed=${seed}`)
 
     const isEasy = difficulty === '简易'
+    const isMedium = difficulty === '适中'
+    const isHard = difficulty === '困难'
+    const anchorCluster = isMedium ? MEDIUM_ANCHOR_CLUSTER : isHard ? HARD_ANCHOR_CLUSTER : []
 
-    // Model selection: GLM-4.7
-    const model = 'glm-4.7'
-    const glmApiUrl = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+    // Primary model: GLM-4.7; fallback model: DeepSeek (optional)
+    const primaryModel = 'glm-4.7'
+    const glmApiUrl = 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions'
     const runStartedAt = Date.now()
 
     const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -35,22 +114,64 @@ Deno.serve(async (req) => {
     const isRetryableStatus = (status: number) =>
       status === 408 || status === 429 || status >= 500
 
-    const requestGLMWithRetry = async (
+    type ProviderName = 'glm' | 'deepseek'
+    type ProviderConfig = { name: ProviderName; apiUrl: string; apiKey: string; model: string }
+    type RequestError = Error & {
+      status?: number
+      retryable?: boolean
+      kind?: 'http' | 'exception'
+      bodySnippet?: string
+    }
+    type RequestResult = {
+      response: Response
+      attempts: number
+      retryCount: number
+      elapsedMs: number
+      provider: ProviderName
+      model: string
+      usedFallback: boolean
+    }
+
+    const primaryProvider: ProviderConfig = {
+      name: 'glm',
+      apiUrl: glmApiUrl,
+      apiKey: glmApiKey,
+      model: primaryModel,
+    }
+    const fallbackProvider: ProviderConfig | null = deepseekApiKey
+      ? {
+        name: 'deepseek',
+        apiUrl: deepseekApiUrl,
+        apiKey: deepseekApiKey,
+        model: deepseekModel,
+      }
+      : null
+
+    const shouldTriggerFallback = (err: unknown): boolean => {
+      const e = err as RequestError
+      if (e?.status === 408 || e?.status === 429) return true
+      if (typeof e?.status === 'number' && e.status >= 500) return true
+      return e?.kind === 'exception'
+    }
+
+    const requestProviderWithRetry = async (
       payload: Record<string, unknown>,
+      provider: ProviderConfig,
       options: { label: string; retries: number; requireBody?: boolean },
     ): Promise<{ response: Response; attempts: number; retryCount: number; elapsedMs: number }> => {
       const retryDelaysMs = [1200, 2500, 4500]
       const requestStartedAt = Date.now()
+      const providerPayload = { ...payload, model: provider.model }
 
       for (let attempt = 0; attempt <= options.retries; attempt++) {
         try {
-          const res = await fetch(glmApiUrl, {
+          const res = await fetch(provider.apiUrl, {
             method: 'POST',
             headers: {
-              'Authorization': `Bearer ${apiKey}`,
+              'Authorization': `Bearer ${provider.apiKey}`,
               'Content-Type': 'application/json',
             },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(providerPayload),
           })
 
           if (res.ok && (!options.requireBody || res.body)) {
@@ -66,18 +187,28 @@ Deno.serve(async (req) => {
           const retryable = isRetryableStatus(res.status) || (res.ok && options.requireBody && !res.body)
 
           console.error(
-            `[${options.label}] GLM request failed: status=${res.status}, attempt=${attempt + 1}/${options.retries + 1}, retryable=${retryable}, body=${errorText.slice(0, 240)}`,
+            `[${options.label}] ${provider.name} request failed: status=${res.status}, attempt=${attempt + 1}/${options.retries + 1}, retryable=${retryable}, body=${errorText.slice(0, 240)}`,
           )
 
           if (!retryable || attempt >= options.retries) {
-            throw new Error(`[${options.label}] GLM request failed with status ${res.status}`)
+            const err = new Error(`[${options.label}] ${provider.name} request failed with status ${res.status}`) as RequestError
+            err.status = res.status
+            err.retryable = retryable
+            err.kind = 'http'
+            err.bodySnippet = errorText.slice(0, 240)
+            throw err
           }
         } catch (err) {
           if (attempt >= options.retries) {
-            throw err
+            const e = err as RequestError
+            if (!e.kind) {
+              e.kind = 'exception'
+              e.retryable = true
+            }
+            throw e
           }
           console.error(
-            `[${options.label}] GLM request exception on attempt ${attempt + 1}/${options.retries + 1}:`,
+            `[${options.label}] ${provider.name} request exception on attempt ${attempt + 1}/${options.retries + 1}:`,
             err,
           )
         }
@@ -86,7 +217,37 @@ Deno.serve(async (req) => {
         await sleep(delay)
       }
 
-      throw new Error(`[${options.label}] GLM request exhausted retries`)
+      throw new Error(`[${options.label}] ${provider.name} request exhausted retries`)
+    }
+
+    const requestWithModelFallback = async (
+      payload: Record<string, unknown>,
+      options: { label: string; retries: number; requireBody?: boolean },
+    ): Promise<RequestResult> => {
+      try {
+        const primaryResult = await requestProviderWithRetry(payload, primaryProvider, options)
+        return {
+          ...primaryResult,
+          provider: primaryProvider.name,
+          model: primaryProvider.model,
+          usedFallback: false,
+        }
+      } catch (primaryErr) {
+        if (!fallbackProvider || !shouldTriggerFallback(primaryErr)) {
+          throw primaryErr
+        }
+        const primaryError = primaryErr as RequestError
+        console.warn(
+          `[${options.label}] Primary model failed (status=${primaryError.status ?? 'n/a'}, kind=${primaryError.kind ?? 'unknown'}). Switching to deepseek fallback.`,
+        )
+        const fallbackResult = await requestProviderWithRetry(payload, fallbackProvider, options)
+        return {
+          ...fallbackResult,
+          provider: fallbackProvider.name,
+          model: fallbackProvider.model,
+          usedFallback: true,
+        }
+      }
     }
 
     let primaryAttempts = 0
@@ -102,19 +263,40 @@ Deno.serve(async (req) => {
     let regenerationRetryCount = 0
     let regenerationElapsedMs = 0
     let regenerationWordsProduced = 0
+    let fallbackUsedCount = 0
+    let fallbackLabels: string[] = []
+    let hotWordReplacements = 0
+    let anchorClusterReplacements = 0
+    let similarityRegenerationTriggered = false
+    let similarityBefore = 0
+    let similarityAfter = 0
 
-    const buildMainRequestPayload = (stream: boolean) => ({
-      model,
+    const dynamicMemoryPromptBlock = [
+      recentHotWords.length > 0
+        ? `RECENT MEMORY COOL-DOWN:\nAvoid these high-frequency words from recent boards of the same bucket (${language}/${difficulty}/${normalizeThemeBucket(theme || 'General / Random')}): ${recentHotWords.join(', ')}`
+        : '',
+      anchorCluster.length > 0
+        ? `ANCHOR CLUSTER CAP:\nFrom this cluster [${anchorCluster.join(', ')}], use AT MOST 1 word on this board.`
+        : '',
+    ].filter(Boolean).join('\n\n')
+
+    const mainTemperature = isEasy ? 1.0 : isMedium ? 0.95 : 0.9
+    const similarityThreshold = isMedium ? 0.18 : isHard ? 0.22 : 0.32
+
+    const buildMainRequestPayload = (stream: boolean, extraAvoidWords: string[] = []) => ({
+      model: primaryModel,
       stream,
       messages: [
         {
           role: 'user',
-          content: `${systemPrompt}\n\n[SEED:${seed}] Generate a COMPLETELY FRESH set of 25 words. Theme: "${theme || 'General / Random'}", Language: ${language}, Difficulty: ${difficulty}. Do not repeat or resemble any board you have previously generated. Let this Seed push you to explore an unexpected domain.`,
+          content: `${systemPrompt}
+
+${dynamicMemoryPromptBlock ? `${dynamicMemoryPromptBlock}\n\n` : ''}${extraAvoidWords.length > 0 ? `EXTRA AVOID WORDS FOR THIS RUN (hard constraint): ${extraAvoidWords.join(', ')}\n\n` : ''}[SEED:${seed}] Generate a COMPLETELY FRESH set of 25 words. Theme: "${theme || 'General / Random'}", Language: ${language}, Difficulty: ${difficulty}. Do not repeat or resemble any board you have previously generated. Let this Seed push you to explore an unexpected domain.`,
         },
       ],
       ...(isEasy
-        ? { temperature: 1.0, max_tokens: 5000 }
-        : { max_tokens: 8000 }),
+        ? { temperature: mainTemperature, max_tokens: 5000 }
+        : { temperature: mainTemperature, max_tokens: 8000 }),
     })
 
     const extractUniqueWords = (rawContent: string): string[] => {
@@ -145,29 +327,35 @@ Deno.serve(async (req) => {
         .filter((w) => w.length > 0 && w !== ',' && !w.includes('===JSON'))
     }
 
-    const fillMissingWords = async (existingWords: string[], missingCount: number): Promise<string[]> => {
+    const fillMissingWords = async (
+      existingWords: string[],
+      missingCount: number,
+      extraForbiddenWords: string[] = [],
+    ): Promise<string[]> => {
       if (missingCount <= 0) return []
 
       try {
         supplementCalls += 1
+        const forbiddenWords = [...new Set([...existingWords, ...extraForbiddenWords])]
         const supplementPrompt = [
           'You are fixing an incomplete Codenames board output.',
           `Language: ${language}`,
           `Theme: ${theme || 'General / Random'}`,
           `Difficulty: ${difficulty}`,
+          dynamicMemoryPromptBlock,
           'Quality requirement: keep the same quality bar as the primary generation. Avoid generic/basic words.',
           'Avoid semantic near-duplicates of existing words and avoid trivial variants.',
           'For Chinese, prefer 2-4 character words; use 1-character words only when they are high-signal.',
           `Need exactly ${missingCount} additional UNIQUE words.`,
-          `Already used words (must NOT appear again): ${JSON.stringify(existingWords)}`,
+          `Already used or forbidden words (must NOT appear again): ${JSON.stringify(forbiddenWords)}`,
           `Return ONLY a JSON array with exactly ${missingCount} strings. No explanation, no markdown.`,
-        ].join('\n')
+        ].filter(Boolean).join('\n')
 
-        const supplementReq = await requestGLMWithRetry({
-          model,
+        const supplementReq = await requestWithModelFallback({
+          model: primaryModel,
           stream: false,
           messages: [{ role: 'user', content: supplementPrompt }],
-          temperature: isEasy ? 0.9 : 1.1,
+          temperature: isEasy ? 0.9 : isMedium ? 0.96 : 0.9,
           max_tokens: 1600,
         }, {
           label: 'supplement',
@@ -177,10 +365,14 @@ Deno.serve(async (req) => {
         supplementAttemptsTotal += supplementReq.attempts
         supplementRetryCountTotal += supplementReq.retryCount
         supplementElapsedTotalMs += supplementReq.elapsedMs
+        if (supplementReq.usedFallback) {
+          fallbackUsedCount += 1
+          fallbackLabels.push('supplement')
+        }
 
         const supplementJson = await supplementRes.json()
         const supplementContent = supplementJson?.choices?.[0]?.message?.content ?? ''
-        const existingSet = new Set(existingWords)
+        const existingSet = new Set(forbiddenWords)
         const supplementalWords = extractUniqueWords(supplementContent)
           .filter((w) => !existingSet.has(w))
           .slice(0, missingCount)
@@ -192,7 +384,10 @@ Deno.serve(async (req) => {
       }
     }
 
-    const regenerateWholeBoard = async (): Promise<string[]> => {
+    const regenerateWholeBoard = async (
+      extraForbiddenWords: string[] = [],
+      regenerationLabel = 'full-regeneration',
+    ): Promise<string[]> => {
       try {
         regenerationTriggered = true
         const regeneratePrompt = [
@@ -200,6 +395,10 @@ Deno.serve(async (req) => {
           `Language: ${language}`,
           `Theme: ${theme || 'General / Random'}`,
           `Difficulty: ${difficulty}`,
+          dynamicMemoryPromptBlock,
+          extraForbiddenWords.length > 0
+            ? `Extra forbidden words for this regeneration: ${extraForbiddenWords.join(', ')}`
+            : '',
           'Quality requirements:',
           '- Keep the same quality level for this difficulty.',
           '- Avoid generic/basic words.',
@@ -208,22 +407,26 @@ Deno.serve(async (req) => {
           'Output requirements:',
           '- Return EXACTLY 25 UNIQUE words.',
           '- Return ONLY a raw JSON array, no explanation, no markdown.',
-        ].join('\n')
+        ].filter(Boolean).join('\n')
 
-        const regenReq = await requestGLMWithRetry({
-          model,
+        const regenReq = await requestWithModelFallback({
+          model: primaryModel,
           stream: false,
           messages: [{ role: 'user', content: regeneratePrompt }],
-          temperature: isEasy ? 0.95 : 1.1,
+          temperature: isEasy ? 0.95 : isMedium ? 0.96 : 0.92,
           max_tokens: 3600,
         }, {
-          label: 'full-regeneration',
+          label: regenerationLabel,
           retries: 1,
         })
         const regenRes = regenReq.response
         regenerationAttempts += regenReq.attempts
         regenerationRetryCount += regenReq.retryCount
         regenerationElapsedMs += regenReq.elapsedMs
+        if (regenReq.usedFallback) {
+          fallbackUsedCount += 1
+          fallbackLabels.push(regenerationLabel)
+        }
 
         const regenJson = await regenRes.json()
         const regenContent = regenJson?.choices?.[0]?.message?.content ?? ''
@@ -236,7 +439,58 @@ Deno.serve(async (req) => {
       }
     }
 
-    const completeBoardWords = async (primaryWords: string[]) => {
+    const topUpWordsTo25 = async (
+      baseWords: string[],
+      extraForbiddenWords: string[] = [],
+    ): Promise<string[]> => {
+      let words = [...new Set(baseWords)].slice(0, 25)
+      if (words.length >= 25) return words
+      const missingCount = 25 - words.length
+      const supplementalWords = await fillMissingWords(words, missingCount, extraForbiddenWords)
+      words = [...words, ...supplementalWords].slice(0, 25)
+      return words
+    }
+
+    const enforceAnchorClusterCap = async (inputWords: string[]): Promise<string[]> => {
+      if (anchorCluster.length === 0) return inputWords
+      const clusterSet = new Set(anchorCluster)
+      let clusterCount = 0
+      const keptWords: string[] = []
+      let removedCount = 0
+      for (const word of inputWords) {
+        if (clusterSet.has(word)) {
+          clusterCount += 1
+          if (clusterCount > 1) {
+            removedCount += 1
+            continue
+          }
+        }
+        keptWords.push(word)
+      }
+      if (removedCount === 0) return inputWords
+      anchorClusterReplacements += removedCount
+      return topUpWordsTo25(keptWords, [...anchorCluster, ...recentHotWords])
+    }
+
+    const suppressRecentHotWords = async (inputWords: string[]): Promise<string[]> => {
+      if (recentHotWords.length === 0) return inputWords
+      const hotSet = new Set(recentHotWords)
+      const maxReplace = isMedium ? 4 : isHard ? 5 : 2
+      const keptWords: string[] = []
+      let replaced = 0
+      for (const word of inputWords) {
+        if (hotSet.has(word) && replaced < maxReplace) {
+          replaced += 1
+          continue
+        }
+        keptWords.push(word)
+      }
+      if (replaced === 0) return inputWords
+      hotWordReplacements += replaced
+      return topUpWordsTo25(keptWords, [...recentHotWords, ...anchorCluster])
+    }
+
+    const completeBoardWords = async (primaryWords: string[], extraForbiddenWords: string[] = []) => {
       let words = [...primaryWords]
       const primaryWordCount = words.length
       let regeneratedWordCount = 0
@@ -244,7 +498,7 @@ Deno.serve(async (req) => {
 
       if (words.length === 0) {
         console.warn('Primary generation produced 0 words. Attempting full regeneration.')
-        const regeneratedWords = await regenerateWholeBoard()
+        const regeneratedWords = await regenerateWholeBoard(extraForbiddenWords)
         regeneratedWordCount = regeneratedWords.length
         words = regeneratedWords
       }
@@ -252,7 +506,7 @@ Deno.serve(async (req) => {
       if (words.length < 25) {
         const missingCount = 25 - words.length
         console.warn(`Primary generation produced ${words.length} words. Attempting to backfill ${missingCount} words.`)
-        const supplementalWords = await fillMissingWords(words, missingCount)
+        const supplementalWords = await fillMissingWords(words, missingCount, extraForbiddenWords)
         supplementalWordCount = supplementalWords.length
         words = [...words, ...supplementalWords]
       }
@@ -263,6 +517,34 @@ Deno.serve(async (req) => {
         regeneratedWordCount,
         supplementalWordCount,
       }
+    }
+
+    const applyDiversityGuards = async (inputWords: string[]) => {
+      let words = [...new Set(inputWords)].slice(0, 25)
+      words = await suppressRecentHotWords(words)
+      words = await enforceAnchorClusterCap(words)
+      words = await topUpWordsTo25(words, [...recentHotWords, ...anchorCluster])
+
+      const before = maxJaccardAgainstRecent(words, recentBoards).maxJaccard
+      similarityBefore = before
+      let after = before
+
+      if (recentBoards.length > 0 && before > similarityThreshold) {
+        similarityRegenerationTriggered = true
+        const mostSimilar = maxJaccardAgainstRecent(words, recentBoards).mostSimilar ?? []
+        const regenAvoidWords = [...new Set([...recentHotWords, ...anchorCluster, ...mostSimilar])].slice(0, 24)
+        console.warn(`Similarity ${before.toFixed(3)} exceeds threshold ${similarityThreshold}. Triggering one regeneration.`)
+        const regeneratedWords = await regenerateWholeBoard(regenAvoidWords, 'similarity-regeneration')
+        const regenCompletion = await completeBoardWords(regeneratedWords, regenAvoidWords)
+        words = [...new Set(regenCompletion.words)].slice(0, 25)
+        words = await suppressRecentHotWords(words)
+        words = await enforceAnchorClusterCap(words)
+        words = await topUpWordsTo25(words, regenAvoidWords)
+        after = maxJaccardAgainstRecent(words, recentBoards).maxJaccard
+      }
+
+      similarityAfter = after
+      return words
     }
 
     const buildCardsFromWords = (allWords: string[]) => {
@@ -302,19 +584,24 @@ Deno.serve(async (req) => {
 
     if (responseMode === 'json') {
       try {
-        const primaryReq = await requestGLMWithRetry(buildMainRequestPayload(false), {
+        const primaryReq = await requestWithModelFallback(buildMainRequestPayload(false), {
           label: 'primary-json',
           retries: 2,
         })
         primaryAttempts = primaryReq.attempts
         primaryRetryCount = primaryReq.retryCount
         primaryElapsedMs = primaryReq.elapsedMs
+        if (primaryReq.usedFallback) {
+          fallbackUsedCount += 1
+          fallbackLabels.push('primary-json')
+        }
 
         const primaryJson = await primaryReq.response.json()
         const primaryContent = primaryJson?.choices?.[0]?.message?.content ?? ''
-        const completion = await completeBoardWords(extractUniqueWords(primaryContent))
+        const completion = await completeBoardWords(extractUniqueWords(primaryContent), [...recentHotWords, ...anchorCluster])
+        const finalWords = await applyDiversityGuards(completion.words)
 
-        if (completion.words.length < 25) {
+        if (finalWords.length < 25) {
           console.log('[generate-board][telemetry]', JSON.stringify({
             difficulty,
             language,
@@ -342,21 +629,56 @@ Deno.serve(async (req) => {
               words: supplementWordsProduced,
             },
             final: {
-              words: completion.words.length,
+              words: finalWords.length,
               regenerated: completion.regeneratedWordCount,
               supplemental: completion.supplementalWordCount,
+            },
+            diversity: {
+              recentBucketSize: recentBoards.length,
+              recentHotWordsCount: recentHotWords.length,
+              hotWordReplacements,
+              anchorClusterReplacements,
+              similarityThreshold,
+              similarityBefore,
+              similarityAfter,
+              similarityRegenerationTriggered,
+            },
+            fallback: {
+              enabled: Boolean(fallbackProvider),
+              usedCount: fallbackUsedCount,
+              labels: fallbackLabels,
             },
             totalMs: Date.now() - runStartedAt,
           }))
           return new Response(JSON.stringify({
-            error: `AI failed to generate 25 words. It generated ${completion.words.length} unique words before stopping (primary=${completion.primaryWordCount}, regenerated=${completion.regeneratedWordCount}, supplemental=${completion.supplementalWordCount}). Please retry.`,
+            error: `AI failed to generate 25 words. It generated ${finalWords.length} unique words before stopping (primary=${completion.primaryWordCount}, regenerated=${completion.regeneratedWordCount}, supplemental=${completion.supplementalWordCount}). Please retry.`,
           }), {
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
             status: 502,
           })
         }
 
-        const cards = buildCardsFromWords(completion.words)
+        const cards = buildCardsFromWords(finalWords)
+        const meta = {
+          primaryProvider: primaryReq.provider,
+          primaryModel: primaryReq.model,
+          primaryUsedFallback: primaryReq.usedFallback,
+          fallback: {
+            enabled: Boolean(fallbackProvider),
+            usedCount: fallbackUsedCount,
+            labels: fallbackLabels,
+          },
+          diversity: {
+            recentBucketSize: recentBoards.length,
+            recentHotWordsCount: recentHotWords.length,
+            hotWordReplacements,
+            anchorClusterReplacements,
+            similarityThreshold,
+            similarityBefore,
+            similarityAfter,
+            similarityRegenerationTriggered,
+          },
+        }
         console.log('[generate-board][telemetry]', JSON.stringify({
           difficulty,
           language,
@@ -384,12 +706,15 @@ Deno.serve(async (req) => {
             words: supplementWordsProduced,
           },
           final: {
-            words: completion.words.length,
+            words: finalWords.length,
           },
+          diversity: meta.diversity,
+          fallback: meta.fallback,
           totalMs: Date.now() - runStartedAt,
         }))
 
-        return new Response(JSON.stringify({ cards }), {
+        addBoardToRecentMemory(historyBucketKey, finalWords)
+        return new Response(JSON.stringify({ cards, meta }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
           status: 200,
         })
@@ -415,7 +740,7 @@ Deno.serve(async (req) => {
     //   data: __DONE__             → stream complete
     //   data: __ERROR__<msg>       → error
     // ──────────────────────────────────────────────────────────
-    const primaryReq = await requestGLMWithRetry(buildMainRequestPayload(true), {
+    const primaryReq = await requestWithModelFallback(buildMainRequestPayload(true), {
       label: 'primary-stream',
       retries: 2,
       requireBody: true,
@@ -424,6 +749,10 @@ Deno.serve(async (req) => {
     primaryAttempts = primaryReq.attempts
     primaryRetryCount = primaryReq.retryCount
     primaryElapsedMs = primaryReq.elapsedMs
+    if (primaryReq.usedFallback) {
+      fallbackUsedCount += 1
+      fallbackLabels.push('primary-stream')
+    }
 
     const { readable, writable } = new TransformStream()
     const writer = writable.getWriter()
@@ -557,30 +886,15 @@ Deno.serve(async (req) => {
           }
 
           // Parse the final content
-          let words = extractUniqueWords(contentText)
-          const primaryWordCount = words.length
-          let regeneratedWordCount = 0
-          let supplementalWordCount = 0
+          const rawPrimaryWords = extractUniqueWords(contentText)
+          const completion = await completeBoardWords(rawPrimaryWords, [...recentHotWords, ...anchorCluster])
+          let words = await applyDiversityGuards(completion.words)
 
-          if (words.length === 0) {
-            console.warn('Primary generation produced 0 words. Attempting full regeneration.')
-            const regeneratedWords = await regenerateWholeBoard()
-            regeneratedWordCount = regeneratedWords.length
-            for (const w of regeneratedWords) {
+          const seenInPrimary = new Set(rawPrimaryWords)
+          for (const w of words) {
+            if (!seenInPrimary.has(w)) {
               await send(`__WORD__${w}`)
             }
-            words = regeneratedWords
-          }
-
-          if (words.length < 25) {
-            const missingCount = 25 - words.length
-            console.warn(`Primary generation produced ${words.length} words. Attempting to backfill ${missingCount} words.`)
-            const supplementalWords = await fillMissingWords(words, missingCount)
-            supplementalWordCount = supplementalWords.length
-            for (const w of supplementalWords) {
-              await send(`__WORD__${w}`)
-            }
-            words = [...words, ...supplementalWords]
           }
 
           if (words.length < 25) {
@@ -594,7 +908,7 @@ Deno.serve(async (req) => {
                 attempts: primaryAttempts,
                 retryCount: primaryRetryCount,
                 elapsedMs: primaryElapsedMs,
-                words: primaryWordCount,
+                words: completion.primaryWordCount,
               },
               stream: {
                 firstDataMs: firstUpstreamDataMs,
@@ -617,12 +931,27 @@ Deno.serve(async (req) => {
               },
               final: {
                 words: words.length,
-                regenerated: regeneratedWordCount,
-                supplemental: supplementalWordCount,
+                regenerated: completion.regeneratedWordCount,
+                supplemental: completion.supplementalWordCount,
+              },
+              diversity: {
+                recentBucketSize: recentBoards.length,
+                recentHotWordsCount: recentHotWords.length,
+                hotWordReplacements,
+                anchorClusterReplacements,
+                similarityThreshold,
+                similarityBefore,
+                similarityAfter,
+                similarityRegenerationTriggered,
+              },
+              fallback: {
+                enabled: Boolean(fallbackProvider),
+                usedCount: fallbackUsedCount,
+                labels: fallbackLabels,
               },
               totalMs: Date.now() - runStartedAt,
             }))
-            await send(`__ERROR__AI failed to generate 25 words. It generated ${words.length} unique words before stopping (primary=${primaryWordCount}, regenerated=${regeneratedWordCount}, supplemental=${supplementalWordCount}). Please retry.`)
+            await send(`__ERROR__AI failed to generate 25 words. It generated ${words.length} unique words before stopping (primary=${completion.primaryWordCount}, regenerated=${completion.regeneratedWordCount}, supplemental=${completion.supplementalWordCount}). Please retry.`)
             return
           }
 
@@ -658,9 +987,31 @@ Deno.serve(async (req) => {
           }
 
           const cards = assignedCards.map((c, index) => ({ ...c, position: index }))
+          const meta = {
+            primaryProvider: primaryReq.provider,
+            primaryModel: primaryReq.model,
+            primaryUsedFallback: primaryReq.usedFallback,
+            fallback: {
+              enabled: Boolean(fallbackProvider),
+              usedCount: fallbackUsedCount,
+              labels: fallbackLabels,
+            },
+            diversity: {
+              recentBucketSize: recentBoards.length,
+              recentHotWordsCount: recentHotWords.length,
+              hotWordReplacements,
+              anchorClusterReplacements,
+              similarityThreshold,
+              similarityBefore,
+              similarityAfter,
+              similarityRegenerationTriggered,
+            },
+          }
 
           await send(`__CARDS__${JSON.stringify(cards)}`)
+          await send(`__META__${JSON.stringify(meta)}`)
           await send('__DONE__')
+          addBoardToRecentMemory(historyBucketKey, words)
           console.log('[generate-board][telemetry]', JSON.stringify({
             difficulty,
             language,
@@ -671,7 +1022,7 @@ Deno.serve(async (req) => {
               attempts: primaryAttempts,
               retryCount: primaryRetryCount,
               elapsedMs: primaryElapsedMs,
-              words: primaryWordCount,
+              words: completion.primaryWordCount,
             },
             stream: {
               firstDataMs: firstUpstreamDataMs,
@@ -695,6 +1046,8 @@ Deno.serve(async (req) => {
             final: {
               words: words.length,
             },
+            fallback: meta.fallback,
+            diversity: meta.diversity,
             totalMs: Date.now() - runStartedAt,
           }))
         } catch (err) {
@@ -728,6 +1081,11 @@ Deno.serve(async (req) => {
               retryCountTotal: supplementRetryCountTotal,
               elapsedMsTotal: supplementElapsedTotalMs,
               words: supplementWordsProduced,
+            },
+            fallback: {
+              enabled: Boolean(fallbackProvider),
+              usedCount: fallbackUsedCount,
+              labels: fallbackLabels,
             },
             totalMs: Date.now() - runStartedAt,
           }))
