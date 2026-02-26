@@ -124,6 +124,7 @@ async function main() {
   const supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY;
   const baseUrl = process.env.E2E_BASE_URL || "http://127.0.0.1:5173";
   const headless = process.env.E2E_HEADLESS !== "0";
+  const routeMode = (process.env.E2E_ROUTE_MODE || "hash").toLowerCase();
   const defaultWaitMs = Number(process.env.E2E_WAIT_MS || 30000);
   const subscribeStabilizeMs = Number(process.env.E2E_SUBSCRIBE_STABILIZE_MS || 2500);
 
@@ -167,7 +168,10 @@ async function main() {
     const pageA = await contextA.newPage();
     const pageB = await contextB.newPage();
 
-    const roomUrl = `${baseUrl}/game/${roomId}`;
+    const roomUrl =
+      routeMode === "browser"
+        ? `${baseUrl}/game/${roomId}`
+        : `${baseUrl}/#/game/${roomId}`;
     await Promise.all([pageA.goto(roomUrl), pageB.goto(roomUrl)]);
 
     await runStep("等待双页面基础加载", async () => {

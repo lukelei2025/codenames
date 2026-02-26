@@ -122,12 +122,43 @@ export default function Game() {
         }
     }, [generating])
 
+    const MAX_GENERATE_ATTEMPTS = 2
+    const GENERATE_RETRY_DELAY_MS = 1200
+
+    const getErrorMessage = (error: unknown) => {
+        if (error instanceof Error) return error.message
+        if (typeof error === 'string') return error
+        try {
+            return JSON.stringify(error)
+        } catch {
+            return String(error)
+        }
+    }
+
+    const isRetryableGenerationError = (error: unknown) => {
+        const message = getErrorMessage(error).toLowerCase()
+        return (
+            message.includes('missing_cards') ||
+            message.includes('edge function error') ||
+            message.includes('fetch failed') ||
+            message.includes('failed to fetch') ||
+            message.includes('terminated') ||
+            message.includes('timeout') ||
+            message.includes('stream') ||
+            message.includes('worker_limit') ||
+            message.includes('http_546')
+        )
+    }
+
     const handleCreateRoom = async () => {
         setShowCreateModal(false)
         setShowGenerationFailModal(false)
         setGenerating(true)
         setWordItems([])
         draftQueueRef.current = []
+
+        const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+        const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY
 
         // Start a drain timer that releases queued draft/reject words smoothly
         if (drainTimerRef.current) clearInterval(drainTimerRef.current)
@@ -142,131 +173,135 @@ export default function Game() {
             }
         }, 300)
         try {
-            // Create the room first
-            const { data: roomData, error: roomError } = await supabase
-                .from('rooms')
-                .insert([{ theme: theme || 'General', language }])
-                .select()
-                .single()
+            for (let attempt = 1; attempt <= MAX_GENERATE_ATTEMPTS; attempt++) {
+                let roomId: string | null = null
+                try {
+                    const { data: roomData, error: roomError } = await supabase
+                        .from('rooms')
+                        .insert([{ theme: theme || 'General', language }])
+                        .select()
+                        .single()
 
-            if (roomError) throw roomError
-            const roomId = roomData.id
+                    if (roomError) throw roomError
+                    roomId = roomData.id
 
-            // Call Edge Function via raw fetch to support SSE streaming
-            const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
-            const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY
-            const res = await fetch(`${supabaseUrl}/functions/v1/generate-board`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${supabaseKey}`,
-                },
-                body: JSON.stringify({ theme, language, difficulty }),
-            })
+                    const res = await fetch(`${supabaseUrl}/functions/v1/generate-board`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${supabaseKey}`,
+                        },
+                        body: JSON.stringify({ theme, language, difficulty }),
+                    })
 
-            if (!res.ok || !res.body) {
-                throw new Error(`Edge Function error: ${res.status}`)
-            }
+                    if (!res.ok || !res.body) {
+                        throw new Error(`Edge Function error: ${res.status}`)
+                    }
 
-            // Parse the SSE stream
-            const reader = res.body.getReader()
-            const decoder = new TextDecoder()
-            let cards: any[] = []
-            let lineBuffer = ''
+                    const reader = res.body.getReader()
+                    const decoder = new TextDecoder()
+                    let cards: any[] = []
+                    let lineBuffer = ''
 
-            outer: while (true) {
-                const { done, value } = await reader.read()
-                if (done) break
+                    outer: while (true) {
+                        const { done, value } = await reader.read()
+                        if (done) break
 
-                lineBuffer += decoder.decode(value, { stream: true })
-                const lines = lineBuffer.split('\n')
-                lineBuffer = lines.pop() ?? ''
+                        lineBuffer += decoder.decode(value, { stream: true })
+                        const lines = lineBuffer.split('\n')
+                        lineBuffer = lines.pop() ?? ''
 
-                for (const line of lines) {
-                    const trimmed = line.trim()
-                    if (!trimmed.startsWith('data:')) continue
-                    const payload = trimmed.slice(5).trim()
+                        for (const line of lines) {
+                            const trimmed = line.trim()
+                            if (!trimmed.startsWith('data:')) continue
+                            const payload = trimmed.slice(5).trim()
 
-                    if (payload === '__DONE__') break outer
-                    if (payload === '__THINKING__') continue
+                            if (payload === '__DONE__') break outer
+                            if (payload === '__THINKING__') continue
 
-                    if (payload.startsWith('__ERROR__')) throw new Error(payload.slice(9))
+                            if (payload.startsWith('__ERROR__')) throw new Error(payload.slice(9))
 
-                    if (payload.startsWith('__CARDS__')) {
-                        try { cards = JSON.parse(payload.slice(9)) } catch (e) { console.error('Cards parse error', e) }
+                            if (payload.startsWith('__CARDS__')) {
+                                try { cards = JSON.parse(payload.slice(9)) } catch (e) { console.error('Cards parse error', e) }
+                                continue
+                            }
+
+                            if (payload.startsWith('__DRAFT__')) {
+                                const word = payload.slice(9)
+                                if (word && !draftQueueRef.current.some(q => q.word === word)) {
+                                    draftQueueRef.current.push({ word, type: 'draft' })
+                                }
+                            }
+
+                            if (payload.startsWith('__REJECT__')) {
+                                const word = payload.slice(10)
+                                if (word) {
+                                    draftQueueRef.current.push({ word, type: 'reject' })
+                                }
+                            }
+
+                            if (payload.startsWith('__WORD__')) {
+                                const word = payload.slice(8)
+                                if (word) {
+                                    setWordItems(prev => {
+                                        const exists = prev.find(w => w.word === word)
+                                        if (exists) return prev.map(w => w.word === word ? { ...w, status: 'confirmed' as const } : w)
+                                        return [...prev, { word, status: 'confirmed' as const }]
+                                    })
+                                }
+                            }
+                        }
+                    }
+
+                    if (!cards.length) throw new Error('missing_cards')
+
+                    // Flush remaining draft queue before showing final cards
+                    if (drainTimerRef.current) { clearInterval(drainTimerRef.current); drainTimerRef.current = null }
+                    while (draftQueueRef.current.length > 0) {
+                        const next = draftQueueRef.current.shift()!
+                        if (next.type === 'draft') {
+                            setWordItems(prev => prev.some(w => w.word === next.word) ? prev : [...prev, { word: next.word, status: 'draft' as const }])
+                        }
+                    }
+
+                    // Final: replace all with confirmed words from cards
+                    const finalWords = cards.map((c: any) => c.word)
+                    setWordItems([])
+                    for (let i = 0; i < finalWords.length; i++) {
+                        await new Promise(r => setTimeout(r, 60))
+                        setWordItems(finalWords.slice(0, i + 1).map((w: string) => ({ word: w, status: 'confirmed' as const })))
+                    }
+                    await new Promise(r => setTimeout(r, 800))
+
+                    const cardsToInsert = cards.map((c: any, index: number) => ({
+                        room_id: roomId,
+                        word: c.word,
+                        color: c.color,
+                        position: index,
+                        is_revealed: false
+                    }))
+                    const { error: cardsError } = await supabase.from('cards').insert(cardsToInsert)
+                    if (cardsError) throw cardsError
+
+                    navigate(`/game/${roomId}`)
+                    return
+                } catch (err) {
+                    console.error(`[create-room attempt ${attempt}]`, err)
+
+                    if (roomId) {
+                        await supabase.from('rooms').delete().eq('id', roomId)
+                    }
+
+                    const shouldRetry = attempt < MAX_GENERATE_ATTEMPTS && isRetryableGenerationError(err)
+                    if (shouldRetry) {
+                        draftQueueRef.current = []
+                        setWordItems([])
+                        await new Promise(r => setTimeout(r, GENERATE_RETRY_DELAY_MS))
                         continue
                     }
-
-                    if (payload.startsWith('__DRAFT__')) {
-                        const word = payload.slice(9)
-                        if (word && !draftQueueRef.current.some(q => q.word === word)) {
-                            draftQueueRef.current.push({ word, type: 'draft' })
-                        }
-                    }
-
-                    if (payload.startsWith('__REJECT__')) {
-                        const word = payload.slice(10)
-                        if (word) {
-                            draftQueueRef.current.push({ word, type: 'reject' })
-                        }
-                    }
-
-                    if (payload.startsWith('__WORD__')) {
-                        const word = payload.slice(8)
-                        if (word) {
-                            setWordItems(prev => {
-                                const exists = prev.find(w => w.word === word)
-                                if (exists) return prev.map(w => w.word === word ? { ...w, status: 'confirmed' as const } : w)
-                                return [...prev, { word, status: 'confirmed' as const }]
-                            })
-                        }
-                    }
+                    throw err
                 }
             }
-
-            // Flush remaining draft queue before showing final cards
-            if (drainTimerRef.current) { clearInterval(drainTimerRef.current); drainTimerRef.current = null }
-            // Quick flush any remaining drafts
-            while (draftQueueRef.current.length > 0) {
-                const next = draftQueueRef.current.shift()!
-                if (next.type === 'draft') {
-                    setWordItems(prev => prev.some(w => w.word === next.word) ? prev : [...prev, { word: next.word, status: 'draft' as const }])
-                }
-            }
-
-            // Final: replace all with confirmed words from cards
-            if (cards.length > 0) {
-                const finalWords = cards.map((c: any) => c.word)
-                setWordItems([])
-                for (let i = 0; i < finalWords.length; i++) {
-                    await new Promise(r => setTimeout(r, 60))
-                    setWordItems(finalWords.slice(0, i + 1).map((w: string) => ({ word: w, status: 'confirmed' as const })))
-                }
-                await new Promise(r => setTimeout(r, 800))
-            }
-
-            if (!cards.length) {
-                // Stream ended without receiving cards — likely Supabase timeout
-                // Clean up the orphaned room
-                await supabase.from('rooms').delete().eq('id', roomId)
-                setShowGenerationFailModal(true)
-                setGenerating(false)
-                setWordItems([])
-                return
-            }
-
-            // Insert cards into DB
-            const cardsToInsert = cards.map((c: any, index: number) => ({
-                room_id: roomId,
-                word: c.word,
-                color: c.color,
-                position: index,
-                is_revealed: false
-            }))
-            const { error: cardsError } = await supabase.from('cards').insert(cardsToInsert)
-            if (cardsError) throw cardsError
-
-            navigate(`/game/${roomId}`)
         } catch (err: any) {
             console.error(err)
             setShowGenerationFailModal(true)
