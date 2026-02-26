@@ -13,7 +13,7 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const { theme = '', language = '中文', difficulty = '适中' } = await req.json()
+    const { theme = '', language = '中文', difficulty = '适中', responseMode = 'stream' } = await req.json()
 
     const apiKey = Deno.env.get('GLM_API_KEY')
     if (!apiKey) throw new Error('GLM_API_KEY is not set')
@@ -103,9 +103,9 @@ Deno.serve(async (req) => {
     let regenerationElapsedMs = 0
     let regenerationWordsProduced = 0
 
-    const mainRequestPayload = {
+    const buildMainRequestPayload = (stream: boolean) => ({
       model,
-      stream: true,
+      stream,
       messages: [
         {
           role: 'user',
@@ -115,17 +115,7 @@ Deno.serve(async (req) => {
       ...(isEasy
         ? { temperature: 1.0, max_tokens: 5000 }
         : { max_tokens: 8000 }),
-    }
-
-    const primaryReq = await requestGLMWithRetry(mainRequestPayload, {
-      label: 'primary-stream',
-      retries: 2,
-      requireBody: true,
     })
-    const apiRes = primaryReq.response
-    primaryAttempts = primaryReq.attempts
-    primaryRetryCount = primaryReq.retryCount
-    primaryElapsedMs = primaryReq.elapsedMs
 
     const extractUniqueWords = (rawContent: string): string[] => {
       let content = rawContent.trim()
@@ -246,6 +236,173 @@ Deno.serve(async (req) => {
       }
     }
 
+    const completeBoardWords = async (primaryWords: string[]) => {
+      let words = [...primaryWords]
+      const primaryWordCount = words.length
+      let regeneratedWordCount = 0
+      let supplementalWordCount = 0
+
+      if (words.length === 0) {
+        console.warn('Primary generation produced 0 words. Attempting full regeneration.')
+        const regeneratedWords = await regenerateWholeBoard()
+        regeneratedWordCount = regeneratedWords.length
+        words = regeneratedWords
+      }
+
+      if (words.length < 25) {
+        const missingCount = 25 - words.length
+        console.warn(`Primary generation produced ${words.length} words. Attempting to backfill ${missingCount} words.`)
+        const supplementalWords = await fillMissingWords(words, missingCount)
+        supplementalWordCount = supplementalWords.length
+        words = [...words, ...supplementalWords]
+      }
+
+      return {
+        words,
+        primaryWordCount,
+        regeneratedWordCount,
+        supplementalWordCount,
+      }
+    }
+
+    const buildCardsFromWords = (allWords: string[]) => {
+      const words = allWords.slice(0, 25)
+
+      // Decouple assassin from length-based assignment to avoid repeated short-word assassin bias.
+      const assassinWordIndex = Math.floor(Math.random() * words.length)
+      const assassinWord = words[assassinWordIndex]
+      const nonAssassinWords = words.filter((_, idx) => idx !== assassinWordIndex)
+      const wordsByLength = [...nonAssassinWords].sort((a, b) => a.length - b.length)
+
+      const colorQuotas = { red: 9, blue: 8, neutral: 7 }
+      const teamOrder = ['red', 'blue', 'neutral'].sort(() => Math.random() - 0.5)
+      const assignedCards: { word: string; color: string }[] = [{ word: assassinWord, color: 'assassin' }]
+      let teamIndex = 0
+
+      for (const word of wordsByLength) {
+        let attempts = 0
+        while (colorQuotas[teamOrder[teamIndex] as keyof typeof colorQuotas] === 0) {
+          teamIndex = (teamIndex + 1) % 3
+          attempts++
+          if (attempts > 3) break
+        }
+        const chosenColor = teamOrder[teamIndex]
+        assignedCards.push({ word, color: chosenColor })
+        colorQuotas[chosenColor as keyof typeof colorQuotas]--
+        teamIndex = (teamIndex + 1) % 3
+      }
+
+      for (let i = assignedCards.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1))
+          ;[assignedCards[i], assignedCards[j]] = [assignedCards[j], assignedCards[i]]
+      }
+
+      return assignedCards.map((c, index) => ({ ...c, position: index }))
+    }
+
+    if (responseMode === 'json') {
+      try {
+        const primaryReq = await requestGLMWithRetry(buildMainRequestPayload(false), {
+          label: 'primary-json',
+          retries: 2,
+        })
+        primaryAttempts = primaryReq.attempts
+        primaryRetryCount = primaryReq.retryCount
+        primaryElapsedMs = primaryReq.elapsedMs
+
+        const primaryJson = await primaryReq.response.json()
+        const primaryContent = primaryJson?.choices?.[0]?.message?.content ?? ''
+        const completion = await completeBoardWords(extractUniqueWords(primaryContent))
+
+        if (completion.words.length < 25) {
+          console.log('[generate-board][telemetry]', JSON.stringify({
+            difficulty,
+            language,
+            theme: theme || 'General / Random',
+            seed,
+            outcome: 'json_insufficient_words',
+            primary: {
+              attempts: primaryAttempts,
+              retryCount: primaryRetryCount,
+              elapsedMs: primaryElapsedMs,
+              words: completion.primaryWordCount,
+            },
+            regeneration: {
+              triggered: regenerationTriggered,
+              attempts: regenerationAttempts,
+              retryCount: regenerationRetryCount,
+              elapsedMs: regenerationElapsedMs,
+              words: regenerationWordsProduced,
+            },
+            supplement: {
+              calls: supplementCalls,
+              attemptsTotal: supplementAttemptsTotal,
+              retryCountTotal: supplementRetryCountTotal,
+              elapsedMsTotal: supplementElapsedTotalMs,
+              words: supplementWordsProduced,
+            },
+            final: {
+              words: completion.words.length,
+              regenerated: completion.regeneratedWordCount,
+              supplemental: completion.supplementalWordCount,
+            },
+            totalMs: Date.now() - runStartedAt,
+          }))
+          return new Response(JSON.stringify({
+            error: `AI failed to generate 25 words. It generated ${completion.words.length} unique words before stopping (primary=${completion.primaryWordCount}, regenerated=${completion.regeneratedWordCount}, supplemental=${completion.supplementalWordCount}). Please retry.`,
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            status: 502,
+          })
+        }
+
+        const cards = buildCardsFromWords(completion.words)
+        console.log('[generate-board][telemetry]', JSON.stringify({
+          difficulty,
+          language,
+          theme: theme || 'General / Random',
+          seed,
+          outcome: 'json_success',
+          primary: {
+            attempts: primaryAttempts,
+            retryCount: primaryRetryCount,
+            elapsedMs: primaryElapsedMs,
+            words: completion.primaryWordCount,
+          },
+          regeneration: {
+            triggered: regenerationTriggered,
+            attempts: regenerationAttempts,
+            retryCount: regenerationRetryCount,
+            elapsedMs: regenerationElapsedMs,
+            words: regenerationWordsProduced,
+          },
+          supplement: {
+            calls: supplementCalls,
+            attemptsTotal: supplementAttemptsTotal,
+            retryCountTotal: supplementRetryCountTotal,
+            elapsedMsTotal: supplementElapsedTotalMs,
+            words: supplementWordsProduced,
+          },
+          final: {
+            words: completion.words.length,
+          },
+          totalMs: Date.now() - runStartedAt,
+        }))
+
+        return new Response(JSON.stringify({ cards }), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 200,
+        })
+      } catch (err) {
+        console.error('JSON mode generation failed:', err)
+        const msg = err instanceof Error ? err.message : 'Unknown error'
+        return new Response(JSON.stringify({ error: msg }), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 502,
+        })
+      }
+    }
+
     // ──────────────────────────────────────────────────────────
     // STREAMING PIPELINE with live reasoning word extraction
     //
@@ -258,6 +415,16 @@ Deno.serve(async (req) => {
     //   data: __DONE__             → stream complete
     //   data: __ERROR__<msg>       → error
     // ──────────────────────────────────────────────────────────
+    const primaryReq = await requestGLMWithRetry(buildMainRequestPayload(true), {
+      label: 'primary-stream',
+      retries: 2,
+      requireBody: true,
+    })
+    const apiRes = primaryReq.response
+    primaryAttempts = primaryReq.attempts
+    primaryRetryCount = primaryReq.retryCount
+    primaryElapsedMs = primaryReq.elapsedMs
+
     const { readable, writable } = new TransformStream()
     const writer = writable.getWriter()
     const encoder = new TextEncoder()

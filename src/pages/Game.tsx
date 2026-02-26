@@ -23,7 +23,7 @@ export default function Game() {
     const [theme, setTheme] = useState('')
     const [language, setLanguage] = useState('中文')
     const [difficulty, setDifficulty] = useState('适中')
-    const [showGenerationFailModal, setShowGenerationFailModal] = useState(false)
+    const [isAutoRetrying, setIsAutoRetrying] = useState(false)
 
     useEffect(() => {
         if (!id) {
@@ -122,43 +122,43 @@ export default function Game() {
         }
     }, [generating])
 
-    const MAX_GENERATE_ATTEMPTS = 2
+    const MAX_GENERATE_ATTEMPTS = 3
     const GENERATE_RETRY_DELAY_MS = 1200
-
-    const getErrorMessage = (error: unknown) => {
-        if (error instanceof Error) return error.message
-        if (typeof error === 'string') return error
-        try {
-            return JSON.stringify(error)
-        } catch {
-            return String(error)
-        }
-    }
-
-    const isRetryableGenerationError = (error: unknown) => {
-        const message = getErrorMessage(error).toLowerCase()
-        return (
-            message.includes('missing_cards') ||
-            message.includes('edge function error') ||
-            message.includes('fetch failed') ||
-            message.includes('failed to fetch') ||
-            message.includes('terminated') ||
-            message.includes('timeout') ||
-            message.includes('stream') ||
-            message.includes('worker_limit') ||
-            message.includes('http_546')
-        )
-    }
 
     const handleCreateRoom = async () => {
         setShowCreateModal(false)
-        setShowGenerationFailModal(false)
         setGenerating(true)
+        setIsAutoRetrying(false)
         setWordItems([])
         draftQueueRef.current = []
 
         const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
         const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+        const fetchCardsFallback = async (): Promise<any[]> => {
+            try {
+                const fallbackRes = await fetch(`${supabaseUrl}/functions/v1/generate-board`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${supabaseKey}`,
+                    },
+                    body: JSON.stringify({ theme, language, difficulty, responseMode: 'json' }),
+                })
+
+                if (!fallbackRes.ok) {
+                    const errorText = await fallbackRes.text().catch(() => '')
+                    console.error('[fallback-json] non-2xx response:', fallbackRes.status, errorText)
+                    return []
+                }
+
+                const fallbackJson = await fallbackRes.json().catch(() => null)
+                const fallbackCards = Array.isArray(fallbackJson?.cards) ? fallbackJson.cards : []
+                return fallbackCards
+            } catch (err) {
+                console.error('[fallback-json] request failed:', err)
+                return []
+            }
+        }
 
         // Start a drain timer that releases queued draft/reject words smoothly
         if (drainTimerRef.current) clearInterval(drainTimerRef.current)
@@ -253,6 +253,13 @@ export default function Game() {
                         }
                     }
 
+                    if (!cards.length) {
+                        const fallbackCards = await fetchCardsFallback()
+                        if (fallbackCards.length > 0) {
+                            cards = fallbackCards
+                        }
+                    }
+
                     if (!cards.length) throw new Error('missing_cards')
 
                     // Flush remaining draft queue before showing final cards
@@ -292,8 +299,9 @@ export default function Game() {
                         await supabase.from('rooms').delete().eq('id', roomId)
                     }
 
-                    const shouldRetry = attempt < MAX_GENERATE_ATTEMPTS && isRetryableGenerationError(err)
+                    const shouldRetry = attempt < MAX_GENERATE_ATTEMPTS
                     if (shouldRetry) {
+                        setIsAutoRetrying(true)
                         draftQueueRef.current = []
                         setWordItems([])
                         await new Promise(r => setTimeout(r, GENERATE_RETRY_DELAY_MS))
@@ -304,10 +312,11 @@ export default function Game() {
             }
         } catch (err: any) {
             console.error(err)
-            setShowGenerationFailModal(true)
+            setShowCreateModal(true)
         } finally {
             if (drainTimerRef.current) { clearInterval(drainTimerRef.current); drainTimerRef.current = null }
             setGenerating(false)
+            setIsAutoRetrying(false)
             setWordItems([])
         }
     }
@@ -609,7 +618,12 @@ export default function Game() {
                             <div className="generating-timer">{generateTimer}</div>
                         </div>
                         <div className="generating-text">
-                            <h3 className="generating-title">使用 glm-4.7 模型创建中<br />预计需要 1-3 分钟</h3>
+                            <h3 className="generating-title">
+                                {isAutoRetrying
+                                    ? '由于大模型或服务器不稳定偶尔报错，别着急，正在重新创建中'
+                                    : <>使用 glm-4.7 模型创建中<br />预计需要 1-3 分钟</>
+                                }
+                            </h3>
                             <p className="generating-subtitle">和朋友们聊聊天吧 ☕</p>
                         </div>
                         <div className="streamed-words-container">
@@ -638,37 +652,6 @@ export default function Game() {
                 </div>
             )}
 
-            {/* Generate Failure Modal */}
-            {showGenerationFailModal && (
-                <div className="modal-overlay">
-                    <div className="modal-content generation-fail-modal">
-                        <button className="close-btn" onClick={() => setShowGenerationFailModal(false)}>
-                            <X size={20} />
-                        </button>
-                        <h2>本轮生成未成功</h2>
-                        <p className="generation-fail-text">
-                            由于模型侧不稳定或服务器响应慢导致偶尔生成失败。不急，尝试重新生成即可！
-                        </p>
-                        <div className="generation-fail-actions">
-                            <button
-                                className="new-game-btn secondary-action-btn"
-                                onClick={() => setShowGenerationFailModal(false)}
-                            >
-                                知道了
-                            </button>
-                            <button
-                                className="new-game-btn"
-                                onClick={() => {
-                                    setShowGenerationFailModal(false)
-                                    setShowCreateModal(true)
-                                }}
-                            >
-                                再次生成
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
         </div>
     )
 }
