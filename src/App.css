@@ -426,6 +426,112 @@
   background-color: var(--color-assassin);
 }
 
+/* Round History */
+.round-history-panel {
+  margin-top: 0.25rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: #fff;
+  padding: 0.85rem 0.9rem;
+}
+
+.round-history-title {
+  margin: 0 0 0.65rem 0;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #6b7280;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.round-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.round-history-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+}
+
+.round-index {
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.74rem;
+  font-weight: 700;
+  margin-top: 1px;
+}
+
+.round-index-red {
+  color: #991b1b;
+  background: #fee2e2;
+  border: 1px solid #fecaca;
+}
+
+.round-index-blue {
+  color: #1e3a8a;
+  background: #dbeafe;
+  border: 1px solid #bfdbfe;
+}
+
+.round-team-label {
+  font-size: 0.9rem;
+  font-weight: 700;
+  line-height: 1.55;
+  min-width: 38px;
+}
+
+.label-red {
+  color: var(--color-red);
+}
+
+.label-blue {
+  color: var(--color-blue);
+}
+
+.round-word-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  line-height: 1.55;
+}
+
+.round-word {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 0.08rem 0.44rem;
+  border-radius: 6px;
+}
+
+.tone-red {
+  color: #991b1b;
+  background: #fef2f2;
+}
+
+.tone-blue {
+  color: #1e3a8a;
+  background: #eff6ff;
+}
+
+.tone-neutral {
+  color: #4b5563;
+  background: #f3f4f6;
+}
+
+.tone-assassin {
+  color: #fff;
+  background: #111827;
+}
+
 /* Modal Styles */
 .modal-overlay {
   position: fixed;
@@ -672,6 +778,20 @@
   .legend-footer {
     flex-wrap: wrap;
     gap: 0.75rem;
+  }
+
+  .round-history-row {
+    flex-wrap: wrap;
+    gap: 0.3rem 0.45rem;
+  }
+
+  .round-team-label {
+    min-width: 34px;
+    font-size: 0.84rem;
+  }
+
+  .round-word {
+    font-size: 0.82rem;
   }
 }
 

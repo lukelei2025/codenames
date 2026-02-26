@@ -15,6 +15,8 @@ const HOT_WORD_MIN_COUNT = 2
 const HOT_WORD_MAX_COUNT = 12
 const MEDIUM_ANCHOR_CLUSTER = ['发酵', '潮汐', '偏见', '内卷', '熵增', '悖论', '杠杆', '防火墙', '算法', '像素']
 const HARD_ANCHOR_CLUSTER = ['熵增', '路径依赖', '认知失调', '破窗效应', '范式转移', '灰犀牛', '黑天鹅', '模因']
+const EN_MEDIUM_ANCHOR_CLUSTER = ['algorithm', 'pixel', 'firewall', 'bubble', 'monopoly', 'radar', 'resonance', 'chip', 'inflation', 'leverage']
+const EN_HARD_ANCHOR_CLUSTER = ['entropy', 'path dependence', 'cognitive dissonance', 'broken window', 'paradigm shift', 'grey rhino', 'black swan', 'meme']
 
 const normalizeThemeBucket = (theme: string): string => {
   const raw = (theme || '').trim().toLowerCase()
@@ -102,7 +104,13 @@ Deno.serve(async (req) => {
     const isEasy = difficulty === '简易'
     const isMedium = difficulty === '适中'
     const isHard = difficulty === '困难'
-    const anchorCluster = isMedium ? MEDIUM_ANCHOR_CLUSTER : isHard ? HARD_ANCHOR_CLUSTER : []
+    const normalizedLanguage = (language || '').trim().toLowerCase()
+    const isEnglish = normalizedLanguage === 'english' || normalizedLanguage === 'en' || normalizedLanguage === '英文' || normalizedLanguage === '英语'
+    const anchorCluster = isMedium
+      ? (isEnglish ? EN_MEDIUM_ANCHOR_CLUSTER : MEDIUM_ANCHOR_CLUSTER)
+      : isHard
+        ? (isEnglish ? EN_HARD_ANCHOR_CLUSTER : HARD_ANCHOR_CLUSTER)
+        : []
 
     // Primary model: GLM-4.7; fallback model: DeepSeek (optional)
     const primaryModel = 'glm-4.7'
@@ -299,6 +307,16 @@ ${dynamicMemoryPromptBlock ? `${dynamicMemoryPromptBlock}\n\n` : ''}${extraAvoid
         : { temperature: mainTemperature, max_tokens: 8000 }),
     })
 
+    const normalizeEnglishToken = (word: string): string => word.replace(/\s+/g, ' ').trim()
+
+    const isEnglishLikeToken = (word: string): boolean => {
+      const normalized = normalizeEnglishToken(word)
+      if (!normalized) return false
+      if (/[\u3400-\u9fff]/.test(normalized)) return false
+      if (!/[A-Za-z]/.test(normalized)) return false
+      return /^[A-Za-z0-9][A-Za-z0-9'’\- ]*[A-Za-z0-9]$/.test(normalized)
+    }
+
     const extractUniqueWords = (rawContent: string): string[] => {
       let content = rawContent.trim()
 
@@ -323,8 +341,14 @@ ${dynamicMemoryPromptBlock ? `${dynamicMemoryPromptBlock}\n\n` : ''}${extraAvoid
       }
 
       const words = Array.isArray(rawWords) ? rawWords.filter((w) => typeof w === 'string') : []
-      return [...new Set<string>(words.map((w: string) => w.trim()))]
+      const uniqueWords = [...new Set<string>(words.map((w: string) => w.trim()))]
         .filter((w) => w.length > 0 && w !== ',' && !w.includes('===JSON'))
+      if (isEnglish) {
+        return uniqueWords
+          .map(normalizeEnglishToken)
+          .filter(isEnglishLikeToken)
+      }
+      return uniqueWords
     }
 
     const fillMissingWords = async (
@@ -342,6 +366,7 @@ ${dynamicMemoryPromptBlock ? `${dynamicMemoryPromptBlock}\n\n` : ''}${extraAvoid
           `Language: ${language}`,
           `Theme: ${theme || 'General / Random'}`,
           `Difficulty: ${difficulty}`,
+          isEnglish ? 'Hard language constraint: English only. Do not output Chinese characters.' : '',
           dynamicMemoryPromptBlock,
           'Quality requirement: keep the same quality bar as the primary generation. Avoid generic/basic words.',
           'Avoid semantic near-duplicates of existing words and avoid trivial variants.',
@@ -395,6 +420,7 @@ ${dynamicMemoryPromptBlock ? `${dynamicMemoryPromptBlock}\n\n` : ''}${extraAvoid
           `Language: ${language}`,
           `Theme: ${theme || 'General / Random'}`,
           `Difficulty: ${difficulty}`,
+          isEnglish ? 'Hard language constraint: English only. Do not output Chinese characters.' : '',
           dynamicMemoryPromptBlock,
           extraForbiddenWords.length > 0
             ? `Extra forbidden words for this regeneration: ${extraForbiddenWords.join(', ')}`
@@ -805,36 +831,50 @@ ${dynamicMemoryPromptBlock ? `${dynamicMemoryPromptBlock}\n\n` : ''}${extraAvoid
               reasoningText += delta.reasoning_content
 
               // Every ~40 new characters of reasoning, scan for quoted Chinese words
-              if (reasoningText.length - lastDraftExtractLen > 40) {
-                lastDraftExtractLen = reasoningText.length
-                const newSection = reasoningText.slice(Math.max(0, lastDraftExtractLen - 300))
+                if (reasoningText.length - lastDraftExtractLen > 40) {
+                  lastDraftExtractLen = reasoningText.length
+                  const newSection = reasoningText.slice(Math.max(0, lastDraftExtractLen - 300))
 
-                // Match words inside Chinese/English quotes (1-4 Chinese chars)
-                const quoteMatches = newSection.match(/["“「『]([一-\u9fff]{1,4})["”」』]/g) ?? []
-                for (const m of quoteMatches) {
-                  const word = m.slice(1, -1)
-                  if (word && !draftWords.has(word) && !rejectedWords.has(word)) {
-                    draftWords.add(word)
-                    await send(`__DRAFT__${word}`)
+                  if (isEnglish) {
+                    // Match short English terms inside quotes for live draft preview.
+                    const quoteMatches = newSection.match(/["“'‘]([A-Za-z][A-Za-z0-9'’\- ]{0,24})["”'’]/g) ?? []
+                    for (const m of quoteMatches) {
+                      const word = normalizeEnglishToken(m.slice(1, -1))
+                      if (word && isEnglishLikeToken(word) && !draftWords.has(word) && !rejectedWords.has(word)) {
+                        draftWords.add(word)
+                        await send(`__DRAFT__${word}`)
+                      }
+                    }
+                  } else {
+                    // Match Chinese draft words inside quotes.
+                    const quoteMatches = newSection.match(/["“「『]([一-\u9fff]{1,4})["”」』]/g) ?? []
+                    for (const m of quoteMatches) {
+                      const word = m.slice(1, -1)
+                      if (word && !draftWords.has(word) && !rejectedWords.has(word)) {
+                        draftWords.add(word)
+                        await send(`__DRAFT__${word}`)
+                      }
+                    }
                   }
-                }
 
-                // Detect rejection patterns: 去掉X, 删除X, 替换X, X太..., 不要X
-                const rejectPatterns = [
-                  /(?:去掉|删除|替换|移除|排除|不[要用])["“「『]?([一-\u9fff]{1,4})["”」』]?/g,
-                  /["“「『]([一-\u9fff]{1,4})["”」』]?(?:太|不太|不够|过于|不适合|删|去)/g,
-                ]
-                for (const pattern of rejectPatterns) {
-                  let match
-                  while ((match = pattern.exec(newSection)) !== null) {
-                    const rejected = match[1]
-                    if (rejected && draftWords.has(rejected) && !rejectedWords.has(rejected)) {
-                      rejectedWords.add(rejected)
-                      await send(`__REJECT__${rejected}`)
+                  // Detect rejection patterns: 去掉X, 删除X, 替换X, X太..., 不要X
+                  const rejectPatterns = [
+                    /(?:去掉|删除|替换|移除|排除|不[要用])["“「『]?([一-\u9fff]{1,4})["”」』]?/g,
+                    /["“「『]([一-\u9fff]{1,4})["”」』]?(?:太|不太|不够|过于|不适合|删|去)/g,
+                    /(?:remove|replace|drop|reject|exclude)\s+["“'‘]?([A-Za-z][A-Za-z0-9'’\- ]{0,24})["”'’]?/gi,
+                    /["“'‘]([A-Za-z][A-Za-z0-9'’\- ]{0,24})["”'’]?\s+(?:is|looks)?\s*(?:too|not|weak|generic|bad)/gi,
+                  ]
+                  for (const pattern of rejectPatterns) {
+                    let match
+                    while ((match = pattern.exec(newSection)) !== null) {
+                      const rejected = isEnglish ? normalizeEnglishToken(match[1]) : match[1]
+                      if (rejected && draftWords.has(rejected) && !rejectedWords.has(rejected)) {
+                        rejectedWords.add(rejected)
+                        await send(`__REJECT__${rejected}`)
+                      }
                     }
                   }
                 }
-              }
             }
 
             // Ensure we only process final output when thinking is definitely over

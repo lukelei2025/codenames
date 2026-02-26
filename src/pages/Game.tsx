@@ -1,7 +1,7 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
-import type { Card, Role, Room, Team } from '../types'
+import type { Card, CardColor, Role, Room, Team, TurnClickLog } from '../types'
 import { RotateCcw, X } from 'lucide-react'
 
 export default function Game() {
@@ -15,6 +15,7 @@ export default function Game() {
     const [generating, setGenerating] = useState(false)
     const [generateTimer, setGenerateTimer] = useState(0)
     const [wordItems, setWordItems] = useState<{ word: string; status: 'draft' | 'rejected' | 'confirmed' }[]>([])
+    const [turnClickLogs, setTurnClickLogs] = useState<TurnClickLog[]>([])
     const draftQueueRef = useRef<{ word: string; type: 'draft' | 'reject' }[]>([])
     const drainTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -30,6 +31,7 @@ export default function Game() {
             // Reset state if we navigate back to root
             setRoom(null)
             setCards([])
+            setTurnClickLogs([])
             return
         }
 
@@ -52,6 +54,19 @@ export default function Game() {
 
                 if (cardsError) throw cardsError
                 setCards(cardsData || [])
+
+                const { data: clickLogsData, error: clickLogsError } = await supabase
+                    .from('turn_click_logs')
+                    .select('*')
+                    .eq('room_id', id)
+                    .order('created_at', { ascending: true })
+
+                if (clickLogsError) {
+                    console.error('Failed to load turn click logs:', clickLogsError)
+                    setTurnClickLogs([])
+                } else {
+                    setTurnClickLogs((clickLogsData || []) as TurnClickLog[])
+                }
             } catch (err: any) {
                 console.error(err)
                 alert('Failed to load game room.')
@@ -93,9 +108,26 @@ export default function Game() {
             })
             .subscribe()
 
+        const turnClickLogSubscription = supabase
+            .channel(`turn_click_logs:${id}`)
+            .on('postgres_changes', {
+                event: 'INSERT',
+                schema: 'public',
+                table: 'turn_click_logs',
+                filter: `room_id=eq.${id}`
+            }, (payload) => {
+                const newLog = payload.new as TurnClickLog
+                setTurnClickLogs(currentLogs => {
+                    if (currentLogs.some(log => log.id === newLog.id)) return currentLogs
+                    return [...currentLogs, newLog]
+                })
+            })
+            .subscribe()
+
         return () => {
             supabase.removeChannel(cardSubscription)
             supabase.removeChannel(roomSubscription)
+            supabase.removeChannel(turnClickLogSubscription)
         }
     }, [id, navigate])
 
@@ -322,7 +354,8 @@ export default function Game() {
     }
 
     const handleRevealCard = async (card: Card) => {
-        if (card.is_revealed || (room && room.winner)) return
+        const roomSnapshot = room
+        if (card.is_revealed || (roomSnapshot && roomSnapshot.winner)) return
 
         try {
             // Optimistic update
@@ -338,13 +371,30 @@ export default function Game() {
 
             if (cardError) throw cardError
 
-            if (!room) return
+            if (roomSnapshot) {
+                const actingTeam = roomSnapshot.current_turn
+                const { error: turnClickLogError } = await supabase
+                    .from('turn_click_logs')
+                    .insert([{
+                        room_id: roomSnapshot.id,
+                        turn_team: actingTeam,
+                        card_word: card.word,
+                        card_color: card.color,
+                        is_correct: card.color === actingTeam,
+                    }])
+
+                if (turnClickLogError) {
+                    console.error('Error recording turn click log:', turnClickLogError)
+                }
+            }
+
+            if (!roomSnapshot) return
 
             // Game Logic evaluation
-            const currentTurn = room.current_turn
+            const currentTurn = roomSnapshot.current_turn
             const opponentTurn = currentTurn === 'red' ? 'blue' : 'red'
             let newTurn = currentTurn
-            let newWinner = room.winner
+            let newWinner = roomSnapshot.winner
 
             // Win conditions
             if (card.color === 'assassin') {
@@ -357,11 +407,11 @@ export default function Game() {
             }
 
             // Only run the db update if game state changed (we don't wait for Realtime here to reduce delay of subsequent checks)
-            if (newTurn !== currentTurn || newWinner !== room.winner) {
+            if (newTurn !== currentTurn || newWinner !== roomSnapshot.winner) {
                 await supabase
                     .from('rooms')
                     .update({ current_turn: newTurn, winner: newWinner })
-                    .eq('id', room.id)
+                    .eq('id', roomSnapshot.id)
             }
 
         } catch (err) {
@@ -413,6 +463,44 @@ export default function Game() {
                 })
         }
     }, [cards, room])
+
+    const orderedTurnClickLogs = useMemo(() => {
+        return [...turnClickLogs].sort((a, b) => {
+            const delta = new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+            if (delta !== 0) return delta
+            return a.id.localeCompare(b.id)
+        })
+    }, [turnClickLogs])
+
+    const turnRounds = useMemo(() => {
+        const rounds: { roundNumber: number; team: Team; logs: TurnClickLog[]; orderedForDisplay: TurnClickLog[] }[] = []
+
+        for (const log of orderedTurnClickLogs) {
+            const lastRound = rounds[rounds.length - 1]
+            if (!lastRound || lastRound.team !== log.turn_team) {
+                rounds.push({
+                    roundNumber: rounds.length + 1,
+                    team: log.turn_team,
+                    logs: [log],
+                    orderedForDisplay: [],
+                })
+            } else {
+                lastRound.logs.push(log)
+            }
+        }
+
+        for (const round of rounds) {
+            const correctLogs = round.logs.filter(log => log.is_correct)
+            const wrongLogs = round.logs.filter(log => !log.is_correct)
+            round.orderedForDisplay = [...correctLogs, ...wrongLogs]
+        }
+
+        return rounds
+    }, [orderedTurnClickLogs])
+
+    const getRoundWordTone = (roundTeam: Team, log: TurnClickLog): CardColor => {
+        return log.is_correct ? roundTeam : log.card_color
+    }
 
     if (loading) return <div className="loading-screen">Loading Game...</div>
 
@@ -535,6 +623,35 @@ export default function Game() {
                             <span className="legend-item"><span className="dot neutral"></span> 中立 ({neutralLeft})</span>
                             <span className="legend-item"><span className="dot assassin"></span> 刺客 ({assassinLeft})</span>
                         </div>
+
+                        {turnRounds.length > 0 && (
+                            <section className="round-history-panel">
+                                <h3 className="round-history-title">回合点词记录</h3>
+                                <div className="round-history-list">
+                                    {turnRounds.map(round => (
+                                        <div key={`${round.team}-${round.roundNumber}`} className={`round-history-row row-${round.team}`}>
+                                            <span className={`round-index round-index-${round.team}`}>{round.roundNumber}</span>
+                                            <span className={`round-team-label label-${round.team}`}>
+                                                {round.team === 'red' ? '红队' : '蓝队'}
+                                            </span>
+                                            <div className="round-word-list">
+                                                {round.orderedForDisplay.map((log, idx) => {
+                                                    const tone = getRoundWordTone(round.team, log)
+                                                    return (
+                                                        <span
+                                                            key={`${log.id}-${idx}`}
+                                                            className={`round-word tone-${tone}`}
+                                                        >
+                                                            {log.card_word}
+                                                        </span>
+                                                    )
+                                                })}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </section>
+                        )}
                     </div>
                 )}
             </main>

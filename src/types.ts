@@ -19,3 +19,13 @@ export interface Card {
     is_revealed: boolean
     position: number
 }
+
+export interface TurnClickLog {
+    id: string
+    room_id: string
+    turn_team: Team
+    card_word: string
+    card_color: CardColor
+    is_correct: boolean
+    created_at: string
+}
