@@ -473,13 +473,15 @@ export default function Game() {
     }, [turnClickLogs])
 
     const turnRounds = useMemo(() => {
-        const rounds: { roundNumber: number; team: Team; logs: TurnClickLog[]; orderedForDisplay: TurnClickLog[] }[] = []
+        const rounds: { displayRoundNumber: number; sequenceIndex: number; team: Team; logs: TurnClickLog[]; orderedForDisplay: TurnClickLog[] }[] = []
 
         for (const log of orderedTurnClickLogs) {
             const lastRound = rounds[rounds.length - 1]
             if (!lastRound || lastRound.team !== log.turn_team) {
+                const sequenceIndex = rounds.length
                 rounds.push({
-                    roundNumber: rounds.length + 1,
+                    displayRoundNumber: Math.floor(sequenceIndex / 2) + 1,
+                    sequenceIndex,
                     team: log.turn_team,
                     logs: [log],
                     orderedForDisplay: [],
@@ -629,8 +631,8 @@ export default function Game() {
                                 <h3 className="round-history-title">回合点词记录</h3>
                                 <div className="round-history-list">
                                     {turnRounds.map(round => (
-                                        <div key={`${round.team}-${round.roundNumber}`} className={`round-history-row row-${round.team}`}>
-                                            <span className={`round-index round-index-${round.team}`}>{round.roundNumber}</span>
+                                        <div key={`${round.team}-${round.sequenceIndex}`} className={`round-history-row row-${round.team}`}>
+                                            <span className={`round-index round-index-${round.team}`}>{round.displayRoundNumber}</span>
                                             <span className={`round-team-label label-${round.team}`}>
                                                 {round.team === 'red' ? '红队' : '蓝队'}
                                             </span>
